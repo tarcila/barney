@@ -6,6 +6,9 @@
 #include <optix.h>
 // #include <optix_function_table.h>
 #include <optix_stubs.h>
+#include <optix_denoiser_tiling.h>
+#include <algorithm>
+#include <cstdint>
 #include <iostream>
 
 namespace rtc {
@@ -104,9 +107,9 @@ namespace rtc {
         BARNEY_CUDA_CALL_NOTHROW(Free(in_normal));
         in_normal = 0;
       }
-      if (out_rgba) {
-        BARNEY_CUDA_CALL_NOTHROW(Free(out_rgba));
-        out_rgba = 0;
+      if (denoiserIntensity) {
+        BARNEY_CUDA_CALL_NOTHROW(Free(denoiserIntensity));
+        denoiserIntensity = 0;
       }
     }
     
@@ -126,23 +129,29 @@ namespace rtc {
       SetActiveGPU forDuration(device);
 
       denoiserSizes.overlapWindowSizeInPixels = 0;
-      // "Image to be denoised" = input for UPSCALE2X (low-res); output for standard denoise.
-      unsigned int memW = upscaleMode ? (unsigned int)numPixels.x : (unsigned int)outputDims.x;
-      unsigned int memH = upscaleMode ? (unsigned int)numPixels.y : (unsigned int)outputDims.y;
-      OptixResult res = optixDenoiserComputeMemoryResources(denoiser, memW, memH, &denoiserSizes);
+      // Clamp denoise resolution to a tile so the uint32 tensor element count
+      // can't overflow on large frames; run() tiles via InvokeTiled. UPSCALE2X
+      // sizes its tensor from the 2x output, so halve the input tile there.
+      constexpr uint32_t kMaxTile = 2048;
+      const uint32_t maxTile = upscaleMode ? kMaxTile / 2 : kMaxTile;
+      tileDims.x = std::min<uint32_t>(maxTile, (unsigned int)numPixels.x);
+      tileDims.y = std::min<uint32_t>(maxTile, (unsigned int)numPixels.y);
+      OptixResult res = optixDenoiserComputeMemoryResources(denoiser, tileDims.x, tileDims.y, &denoiserSizes);
       if (res != OPTIX_SUCCESS) {
         std::cerr << "[barney] optixDenoiserComputeMemoryResources failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
       }
+      overlapWindow = denoiserSizes.overlapWindowSizeInPixels;
       // --------------------------------------------
       if (denoiserScratch) {
         BARNEY_CUDA_CALL(Free(denoiserScratch));
         denoiserScratch = 0;
       }
+      // tiled invoke needs the with-overlap scratch
       BARNEY_CUDA_CALL(Malloc(&denoiserScratch,
-                              denoiserSizes.withoutOverlapScratchSizeInBytes));
+                              denoiserSizes.withOverlapScratchSizeInBytes));
       
       // --------------------------------------------
       if (denoiserState) {
@@ -157,35 +166,37 @@ namespace rtc {
         in_rgba = 0;
       }
       BARNEY_CUDA_CALL(Malloc(&in_rgba,
-                              numPixels.x*numPixels.y*sizeof(*in_rgba)));
+                              (size_t)numPixels.x*numPixels.y*sizeof(*in_rgba)));
       // --- output buffer at output (possibly 2x) resolution ---
       if (out_rgba) {
         BARNEY_CUDA_CALL(Free(out_rgba));
         out_rgba = 0;
       }
       BARNEY_CUDA_CALL(Malloc(&out_rgba,
-                              outputDims.x*outputDims.y*sizeof(*out_rgba)));
+                              (size_t)outputDims.x*outputDims.y*sizeof(*out_rgba)));
       // --- normal guide at render resolution ---
       if (in_normal) {
         BARNEY_CUDA_CALL(Free(in_normal));
         in_normal = 0;
       }
       BARNEY_CUDA_CALL(Malloc(&in_normal,
-                              numPixels.x*numPixels.y*sizeof(*in_normal)));
+                              (size_t)numPixels.x*numPixels.y*sizeof(*in_normal)));
+      // --- whole-frame autoexposure intensity (single float) ---
+      if (!denoiserIntensity)
+        BARNEY_CUDA_CALL(Malloc(&denoiserIntensity, sizeof(*denoiserIntensity)));
       // --------------------------------------------
       
-      // Setup takes INPUT dimensions (max input layer size). For UPSCALE2X
-      // the denoiser then produces 2x output; if we passed output dims here
-      // it would treat input as that size and produce 4x, and we'd only read
-      // the top-left quarter.
+      // Setup takes INPUT dims; UPSCALE2X produces 2x output from them (passing
+      // output dims would yield 4x). Size to the largest padded tile fed by the
+      // tiled invoke (tile + 2*overlap).
       res = optixDenoiserSetup(denoiser,
                          0,
-                         numPixels.x,
-                         numPixels.y,
+                         tileDims.x + 2 * overlapWindow,
+                         tileDims.y + 2 * overlapWindow,
                          (CUdeviceptr)denoiserState,
                          denoiserSizes.stateSizeInBytes,
                          (CUdeviceptr)denoiserScratch,
-                         denoiserSizes.withoutOverlapScratchSizeInBytes
+                         denoiserSizes.withOverlapScratchSizeInBytes
                          );
       if (res != OPTIX_SUCCESS) {
         std::cerr << "[barney] optixDenoiserSetup failed (code "
@@ -234,7 +245,25 @@ namespace rtc {
       /// and unmodified input.
       denoiserParams.blendFactor      = blendFactor;
       cudaStream_t denoiserStream = 0;
-      OptixResult res = optixDenoiserInvoke
+
+      // Whole-frame autoexposure so tiles share one intensity; per-tile
+      // normalization would jump brightness at seams.
+      OptixResult res = optixDenoiserComputeIntensity
+        (denoiser, denoiserStream, &layer.input,
+         (CUdeviceptr)denoiserIntensity,
+         (CUdeviceptr)denoiserScratch,
+         denoiserSizes.withOverlapScratchSizeInBytes);
+      if (res != OPTIX_SUCCESS) {
+        std::cerr << "[barney] optixDenoiserComputeIntensity failed (code "
+                  << (int)res << "); denoiser disabled." << std::endl;
+        available = false;
+        return;
+      }
+      denoiserParams.hdrIntensity = (CUdeviceptr)denoiserIntensity;
+
+      // Descriptors stay full-frame; the helper slices them per tile (single
+      // invoke when the frame fits one tile).
+      res = optixUtilDenoiserInvokeTiled
         (
          denoiser,
          denoiserStream,
@@ -244,13 +273,14 @@ namespace rtc {
          &guideLayer,
          &layer,
          1,
-         0,
-         0,
          (CUdeviceptr)denoiserScratch,
-         denoiserSizes.withoutOverlapScratchSizeInBytes
+         denoiserSizes.withOverlapScratchSizeInBytes,
+         overlapWindow,
+         tileDims.x,
+         tileDims.y
          );
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] optixDenoiserInvoke failed (code "
+        std::cerr << "[barney] optixUtilDenoiserInvokeTiled failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
