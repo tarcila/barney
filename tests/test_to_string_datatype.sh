@@ -20,7 +20,7 @@ TMPDIR_TEST="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR_TEST"' EXIT
 
 # Extract the real to_string(BNDataType) function from Data.cpp.
-sed -n '/std::string to_string(BNDataType type)/,/^  }/p' "$DATA_CPP" \
+sed -n '/std::string to_string(BNDataType type)/,/^}$/p' "$DATA_CPP" \
   > "$TMPDIR_TEST/to_string.inc"
 
 if ! grep -q 'switch' "$TMPDIR_TEST/to_string.inc"; then
