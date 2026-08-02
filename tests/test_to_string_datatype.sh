@@ -43,6 +43,8 @@ cat > "$TMPDIR_TEST/main.cpp" <<'EOF'
 // barney/common/Data.cpp:
 #include "to_string.inc"
 
+using namespace BARNEY_NS;
+
 static int failures = 0;
 
 static void expect(BNDataType type, const char *expected)
