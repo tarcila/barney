@@ -48,6 +48,9 @@ namespace rtc {
       void                *denoiserState   = 0;
       /*! whole-frame autoexposure intensity, shared by all tiles */
       float               *denoiserIntensity = 0;
+      /*! whole-frame average log color (3 floats), shared by all tiles;
+          the AOV model auto-computes this per tile if left null */
+      float               *denoiserAvgColor = 0;
       OptixDenoiserSizes   denoiserSizes;
 
       /*! max tile per invoke; caps the uint32 tensor element count so large

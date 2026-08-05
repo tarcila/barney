@@ -31,7 +31,7 @@ namespace rtc {
       OptixDenoiserModelKind modelKind
         = upscaleMode
         ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X
-        : OPTIX_DENOISER_MODEL_KIND_HDR;
+        : OPTIX_DENOISER_MODEL_KIND_AOV;
 
       OptixDeviceContext optixContext
         = owlContextGetOptixContext(device->owl,0);
@@ -40,7 +40,7 @@ namespace rtc {
                           &denoiserOptions,
                           &denoiser);
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] OptiX denoiser creation failed (code "
+        std::cerr << "#barney(warn): OptiX denoiser creation failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         denoiser = {};
         available = false;
@@ -64,7 +64,7 @@ namespace rtc {
       OptixDenoiserModelKind modelKind
         = upscaleMode
         ? OPTIX_DENOISER_MODEL_KIND_UPSCALE2X
-        : OPTIX_DENOISER_MODEL_KIND_HDR;
+        : OPTIX_DENOISER_MODEL_KIND_AOV;
 
       OptixDeviceContext optixContext
         = owlContextGetOptixContext(device->owl,0);
@@ -73,7 +73,7 @@ namespace rtc {
                           &denoiserOptions,
                           &denoiser);
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] OptiX denoiser re-creation failed (code "
+        std::cerr << "#barney(warn): OptiX denoiser re-creation failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         denoiser = {};
         available = false;
@@ -111,6 +111,10 @@ namespace rtc {
         BARNEY_CUDA_CALL_NOTHROW(Free(denoiserIntensity));
         denoiserIntensity = 0;
       }
+      if (denoiserAvgColor) {
+        BARNEY_CUDA_CALL_NOTHROW(Free(denoiserAvgColor));
+        denoiserAvgColor = 0;
+      }
     }
     
     void Optix8Denoiser::resize(vec2i numPixels)
@@ -138,7 +142,7 @@ namespace rtc {
       tileDims.y = std::min<uint32_t>(maxTile, (unsigned int)numPixels.y);
       OptixResult res = optixDenoiserComputeMemoryResources(denoiser, tileDims.x, tileDims.y, &denoiserSizes);
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] optixDenoiserComputeMemoryResources failed (code "
+        std::cerr << "#barney(warn): optixDenoiserComputeMemoryResources failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
@@ -184,6 +188,11 @@ namespace rtc {
       // --- whole-frame autoexposure intensity (single float) ---
       if (!denoiserIntensity)
         BARNEY_CUDA_CALL(Malloc(&denoiserIntensity, sizeof(*denoiserIntensity)));
+      // --- whole-frame average log color (three floats) ---
+      constexpr size_t kAvgColorChannels = 3;
+      if (!denoiserAvgColor)
+        BARNEY_CUDA_CALL(Malloc(&denoiserAvgColor,
+                                kAvgColorChannels*sizeof(*denoiserAvgColor)));
       // --------------------------------------------
       
       // Setup takes INPUT dims; UPSCALE2X produces 2x output from them (passing
@@ -199,7 +208,7 @@ namespace rtc {
                          denoiserSizes.withOverlapScratchSizeInBytes
                          );
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] optixDenoiserSetup failed (code "
+        std::cerr << "#barney(warn): optixDenoiserSetup failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
@@ -254,12 +263,27 @@ namespace rtc {
          (CUdeviceptr)denoiserScratch,
          denoiserSizes.withOverlapScratchSizeInBytes);
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] optixDenoiserComputeIntensity failed (code "
+        std::cerr << "#barney(warn): optixDenoiserComputeIntensity failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
       }
       denoiserParams.hdrIntensity = (CUdeviceptr)denoiserIntensity;
+
+      // Same reasoning for the AOV model's average log color: left null it is
+      // auto-computed per tile, which makes tiles disagree on color balance.
+      res = optixDenoiserComputeAverageColor
+        (denoiser, denoiserStream, &layer.input,
+         (CUdeviceptr)denoiserAvgColor,
+         (CUdeviceptr)denoiserScratch,
+         denoiserSizes.withOverlapScratchSizeInBytes);
+      if (res != OPTIX_SUCCESS) {
+        std::cerr << "#barney(warn): optixDenoiserComputeAverageColor failed (code "
+                  << (int)res << "); denoiser disabled." << std::endl;
+        available = false;
+        return;
+      }
+      denoiserParams.hdrAverageColor = (CUdeviceptr)denoiserAvgColor;
 
       // Descriptors stay full-frame; the helper slices them per tile (single
       // invoke when the frame fits one tile).
@@ -280,7 +304,7 @@ namespace rtc {
          tileDims.y
          );
       if (res != OPTIX_SUCCESS) {
-        std::cerr << "[barney] optixUtilDenoiserInvokeTiled failed (code "
+        std::cerr << "#barney(warn): optixUtilDenoiserInvokeTiled failed (code "
                   << (int)res << "); denoiser disabled." << std::endl;
         available = false;
         return;
