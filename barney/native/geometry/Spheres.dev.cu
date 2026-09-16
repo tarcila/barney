@@ -78,7 +78,7 @@ namespace BARNEY_NS {
         objectP = objectCenter + (objectRadius+eps)*objectN;
     
         vec3f worldN
-          = ti.transformVectorFromObjectToWorldSpace(objectN);
+          = ti.transformNormalFromObjectToWorldSpace(objectN);
 
         HitAttributes hitData;
         hitData.worldPosition   = worldP;
