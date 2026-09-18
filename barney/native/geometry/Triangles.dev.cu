@@ -111,6 +111,18 @@ namespace BARNEY_NS {
         hitData.worldNormal
           = ti.transformNormalFromObjectToWorldSpace
           ((const vec3f&)hitData.objectNormal);
+        // Tangents transform as vectors (model matrix), unlike normals. w
+        // carries glTF handedness; it is interpolated per-vertex so collapse
+        // it back to a sign. w==0 means no tangent array was set.
+        // NOTE: mirrored-instance handedness (negative transform determinant)
+        // is not folded into w here; known limitation for mirrored UVs.
+        if (hitData.objectTangent.w != 0.f) {
+          const vec3f wt = ti.transformVectorFromObjectToWorldSpace
+            ((const vec3f&)hitData.objectTangent);
+          const float handedness = (hitData.objectTangent.w < 0.f) ? -1.f : 1.f;
+          hitData.worldTangent = make_vec4f(wt);
+          hitData.worldTangent.w = handedness;
+        }
 
         const DeviceMaterial &material
           = world.materials[self.materialID];
